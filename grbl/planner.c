@@ -22,8 +22,7 @@
 */
 
 #include "grbl.h"
-
-
+#include "config.h"
 static plan_block_t block_buffer[BLOCK_BUFFER_SIZE];  // A ring buffer for motion instructions
 static uint8_t block_buffer_tail;     // Index of the block to process now
 static uint8_t block_buffer_head;     // Index of the next block to be pushed
@@ -328,20 +327,21 @@ uint8_t plan_buffer_line(float *target, plan_line_data_t *pl_data)
   uint8_t idx;
 
   // Copy position data based on type of motion being planned.
-  if (block->condition & PL_COND_FLAG_SYSTEM_MOTION) {
-    #ifdef COREXY
-      position_steps[AXIS_1] = system_convert_corexy_to_x_axis_steps(sys_position);
-      position_steps[AXIS_2] = system_convert_corexy_to_y_axis_steps(sys_position);
-      position_steps[AXIS_3] = sys_position[AXIS_3];
-      #if N_AXIS > 3
-        position_steps[AXIS_4] = sys_position[AXIS_4];
+ if (block->condition & PL_COND_FLAG_SYSTEM_MOTION) {
+    #if defined(COREXY) || defined(COREBC) || defined(COREZA)
+      #ifdef COREXY
+        position_steps[AXIS_1] = system_convert_corexy_to_x_axis_steps(sys_position);
+        position_steps[AXIS_2] = system_convert_corexy_to_y_axis_steps(sys_position);
       #endif
-      #if N_AXIS > 4
-        position_steps[AXIS_5] = sys_position[AXIS_5];
+      #ifdef COREZA
+        position_steps[AXIS_3] = system_convert_coreza_to_z_axis_steps(sys_position);
+        position_steps[AXIS_4] = system_convert_coreza_to_a_axis_steps(sys_position);
       #endif
-      #if N_AXIS > 5
-        position_steps[AXIS_6] = sys_position[AXIS_6];
+      #ifdef COREBC
+        position_steps[AXIS_5] = system_convert_corebc_to_b_axis_steps(sys_position);
+        position_steps[AXIS_6] = system_convert_corebc_to_c_axis_steps(sys_position);
       #endif
+      
     #else
       memcpy(position_steps, sys_position, sizeof(sys_position));
     #endif
@@ -353,30 +353,65 @@ uint8_t plan_buffer_line(float *target, plan_line_data_t *pl_data)
     block->steps[A_MOTOR] = labs((target_steps[AXIS_1]-position_steps[AXIS_1]) + (target_steps[AXIS_2]-position_steps[AXIS_2]));
     block->steps[B_MOTOR] = labs((target_steps[AXIS_1]-position_steps[AXIS_1]) - (target_steps[AXIS_2]-position_steps[AXIS_2]));
   #endif
+#ifdef COREZA
+    target_steps[C_MOTOR] = lround(target[C_MOTOR]*settings.steps_per_mm[C_MOTOR]);
+    target_steps[D_MOTOR] = lround(target[D_MOTOR]*settings.steps_per_mm[D_MOTOR]);
+    block->steps[C_MOTOR] = labs((target_steps[AXIS_3]-position_steps[AXIS_3]));
+    block->steps[D_MOTOR] = labs((target_steps[AXIS_3]/24-position_steps[AXIS_3]/24) - (target_steps[AXIS_4]-position_steps[AXIS_4]));
+  #endif
+  #ifdef COREBC
+    target_steps[E_MOTOR] = lround(target[E_MOTOR]*settings.steps_per_mm[E_MOTOR]);
+    target_steps[F_MOTOR] = lround(target[F_MOTOR]*settings.steps_per_mm[F_MOTOR]);
+    block->steps[E_MOTOR] = labs((target_steps[AXIS_5]-position_steps[AXIS_5]) + (target_steps[AXIS_6]-position_steps[AXIS_6]));
+    block->steps[F_MOTOR] = labs((target_steps[AXIS_5]-position_steps[AXIS_5]) - (target_steps[AXIS_6]-position_steps[AXIS_6]));
+  #endif
+  
 
-  for (idx=0; idx<N_AXIS; idx++) {
+
+ for (idx=0; idx<N_AXIS; idx++) {
     // Calculate target position in absolute steps, number of steps for each axis, and determine max step events.
     // Also, compute individual axes distance for move and prep unit vector calculations.
     // NOTE: Computes true distance from converted step values.
     #ifdef COREXY
-      if ( !(idx == A_MOTOR) && !(idx == B_MOTOR) ) {
-        target_steps[idx] = lround(target[idx]*settings.steps_per_mm[idx]);
-        block->steps[idx] = labs(target_steps[idx]-position_steps[idx]);
-      }
-      block->step_event_count = max(block->step_event_count, block->steps[idx]);
-      if (idx == A_MOTOR) {
-        delta_mm = (target_steps[AXIS_1]-position_steps[AXIS_1] + target_steps[AXIS_2]-position_steps[AXIS_2])/settings.steps_per_mm[idx];
-      } else if (idx == B_MOTOR) {
-        delta_mm = (target_steps[AXIS_1]-position_steps[AXIS_1] - target_steps[AXIS_2]+position_steps[AXIS_2])/settings.steps_per_mm[idx];
-      } else {
-        delta_mm = (target_steps[idx] - position_steps[idx])/settings.steps_per_mm[idx];
-      }
+  if ( !(idx == A_MOTOR) && !(idx == B_MOTOR) ) {
+    target_steps[idx] = lround(target[idx]*settings.steps_per_mm[idx]);
+    block->steps[idx] = labs(target_steps[idx]-position_steps[idx]);
+  }
+  block->step_event_count = max(block->step_event_count, block->steps[idx]);
+  if (idx == A_MOTOR) {
+    delta_mm = (target_steps[AXIS_1]-position_steps[AXIS_1] + target_steps[AXIS_2]-position_steps[AXIS_2])/settings.steps_per_mm[idx];
+  } else if (idx == B_MOTOR) {
+    delta_mm = (target_steps[AXIS_1]-position_steps[AXIS_1] - target_steps[AXIS_2]+position_steps[AXIS_2])/settings.steps_per_mm[idx];
+  } else {
+    delta_mm = (target_steps[idx] - position_steps[idx])/settings.steps_per_mm[idx];
+  }
+#elif defined(COREBC) || defined(COREZA)
+  if ( !(idx == E_MOTOR) && !(idx == F_MOTOR) && !(idx == C_MOTOR) && !(idx == D_MOTOR)) {
+    target_steps[idx] = lround(target[idx]*settings.steps_per_mm[idx]);
+    block->steps[idx] = labs(target_steps[idx]-position_steps[idx]);
+  }
+  block->step_event_count = max(block->step_event_count, block->steps[idx]);
+  if (idx == E_MOTOR) {
+    delta_mm = (target_steps[AXIS_5]-position_steps[AXIS_5] + target_steps[AXIS_6]-position_steps[AXIS_6])/settings.steps_per_mm[idx];
+  } else if (idx == F_MOTOR) {
+    delta_mm = (target_steps[AXIS_5]-position_steps[AXIS_5] - target_steps[AXIS_6]+position_steps[AXIS_6])/settings.steps_per_mm[idx];
+  } else if (idx == C_MOTOR) {
+    delta_mm = (target_steps[AXIS_3]-position_steps[AXIS_3] + target_steps[AXIS_4]-position_steps[AXIS_4])/settings.steps_per_mm[idx];
+  } else if (idx == D_MOTOR) {
+    delta_mm = (target_steps[AXIS_3]-position_steps[AXIS_3] - target_steps[AXIS_4]+position_steps[AXIS_4])/settings.steps_per_mm[idx];
+  } else {
+    delta_mm = (target_steps[idx] - position_steps[idx])/settings.steps_per_mm[idx];
+  }
+
+
     #else
       target_steps[idx] = lround(target[idx]*settings.steps_per_mm[idx]);
       block->steps[idx] = labs(target_steps[idx]-position_steps[idx]);
       block->step_event_count = max(block->step_event_count, block->steps[idx]);
       delta_mm = (target_steps[idx] - position_steps[idx])/settings.steps_per_mm[idx];
-    #endif
+
+  #endif
+   
     unit_vec[idx] = delta_mm; // Store unit vector numerator
 
     // Set direction bits. Bit enabled always means direction is negative.
@@ -496,6 +531,7 @@ void plan_sync_position()
     #else
       pl.position[idx] = sys_position[idx];
     #endif
+  
   }
 }
 

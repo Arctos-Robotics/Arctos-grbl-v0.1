@@ -368,20 +368,27 @@ void limits_go_home(uint8_t cycle_mask)
   float target[N_AXIS];
   float max_travel = 0.0;
   uint8_t idx;
-  for (idx=0; idx<N_AXIS; idx++) {
-    // Initialize step pin masks
-    step_pin[idx] = get_step_pin_mask(idx);
-    #ifdef COREXY
-      if ((idx==A_MOTOR)||(idx==B_MOTOR)) { step_pin[idx] = (get_step_pin_mask(AXIS_1)|get_step_pin_mask(AXIS_2)); }
-    #endif
+ for (idx=0; idx<N_AXIS; idx++) {
+// Initialize step pin masks
+step_pin[idx] = get_step_pin_mask(idx);
+#ifdef COREXY
+if ((idx==A_MOTOR)||(idx==B_MOTOR)) { step_pin[idx] = (get_step_pin_mask(AXIS_1)|get_step_pin_mask(AXIS_2)); }
+#endif
+#ifdef COREZA
+if ((idx==C_MOTOR)||(idx==D_MOTOR)) { step_pin[idx] = (get_step_pin_mask(AXIS_3)|get_step_pin_mask(AXIS_4)); }
+#endif
+#ifdef COREBC
+if ((idx==E_MOTOR)||(idx==F_MOTOR)) { step_pin[idx] = (get_step_pin_mask(AXIS_5)|get_step_pin_mask(AXIS_6)); }
+#endif
 
-    if (bit_istrue(cycle_mask,bit(idx))) {
-      // Set target based on max_travel setting. Ensure homing switches engaged with search scalar.
-      // NOTE: settings.max_travel[] is stored as a negative value.
-      max_travel = max(max_travel,(-HOMING_AXIS_SEARCH_SCALAR)*settings.max_travel[idx]);
-      if (max_travel < HOMING_AXIS_LOCATE_SCALAR) { system_set_exec_alarm(EXEC_ALARM_HOMING_FAIL_TRAVEL); }
-    }
-  }
+
+if (bit_istrue(cycle_mask,bit(idx))) {
+// Set target based on max_travel setting. Ensure homing switches engaged with search scalar.
+// NOTE: settings.max_travel[] is stored as a negative value.
+max_travel = max(max_travel,(-HOMING_AXIS_SEARCH_SCALAR)*settings.max_travel[idx]);
+if (max_travel < HOMING_AXIS_LOCATE_SCALAR) { system_set_exec_alarm(EXEC_ALARM_HOMING_FAIL_TRAVEL); }
+}
+}
 
   // Set search mode with approach at seek rate to quickly engage the specified cycle_mask limit switches.
   bool approach = true;
@@ -393,39 +400,60 @@ void limits_go_home(uint8_t cycle_mask)
     system_convert_array_steps_to_mpos(target,sys_position);
 
     // Initialize and declare variables needed for homing routine.
-    n_active_axis = 0;
     for (idx=0; idx<N_AXIS; idx++) {
-      axislock[idx]=0;
-      // Set target location for active axes and setup computation for homing rate.
-      if (bit_istrue(cycle_mask,bit(idx))) {
-        n_active_axis++;
-        #ifdef COREXY
-          if (idx == AXIS_1) {
-            int32_t axis_position = system_convert_corexy_to_y_axis_steps(sys_position);
-            sys_position[A_MOTOR] = axis_position;
-            sys_position[B_MOTOR] = -axis_position;
-          } else if (idx == AXIS_2) {
-            int32_t axis_position = system_convert_corexy_to_x_axis_steps(sys_position);
-            sys_position[A_MOTOR] = sys_position[B_MOTOR] = axis_position;
-          } else {
-            sys_position[AXIS_3] = 0;
-          }
-        #else
-          sys_position[idx] = 0;
-        #endif
-        // Set target direction based on cycle mask and homing cycle approach state.
-        // NOTE: This happens to compile smaller than any other implementation tried.
-        if (bit_istrue(settings.homing_dir_mask,bit(idx))) {
-          if (approach) { target[idx] = -max_travel; }
-          else { target[idx] = max_travel; }
-        } else {
-          if (approach) { target[idx] = max_travel; }
-          else { target[idx] = -max_travel; }
-        }
-        // Apply axislock to the step port pins active in this cycle.
-        axislock[idx] = step_pin[idx];
-        sys.homing_axis_lock[idx] = axislock[idx];
-      }
+axislock[idx]=0;
+// Set target location for active axes and setup computation for homing rate.
+if (bit_istrue(cycle_mask,bit(idx))) {
+n_active_axis++;
+#ifdef COREXY
+if (idx == AXIS_1) {
+int32_t axis_position = system_convert_corexy_to_y_axis_steps(sys_position);
+sys_position[A_MOTOR] = axis_position;
+sys_position[B_MOTOR] = -axis_position;
+} else if (idx == AXIS_2) {
+int32_t axis_position = system_convert_corexy_to_x_axis_steps(sys_position);
+sys_position[A_MOTOR] = sys_position[B_MOTOR] = axis_position;
+} else {
+sys_position[idx] = 0;
+}
+#elif defined(COREBC)
+if (idx == AXIS_5) {
+int32_t axis_position = system_convert_corebc_to_c_axis_steps(sys_position);
+sys_position[E_MOTOR] = axis_position;
+sys_position[F_MOTOR] = -axis_position;
+} else if (idx == AXIS_6) {
+int32_t axis_position = system_convert_corebc_to_b_axis_steps(sys_position);
+sys_position[E_MOTOR] = sys_position[F_MOTOR] = axis_position;
+} else {
+sys_position[idx] = 0;
+}
+#elif defined(COREZA)
+if (idx == AXIS_3) {
+int32_t axis_position = system_convert_coreza_to_a_axis_steps(sys_position);
+sys_position[C_MOTOR] = axis_position;
+sys_position[D_MOTOR] = -axis_position;
+} else if (idx == AXIS_4) {
+int32_t axis_position = system_convert_coreza_to_z_axis_steps(sys_position);
+sys_position[C_MOTOR] = sys_position[D_MOTOR] = axis_position;
+} else {
+sys_position[idx] = 0;
+}
+#else
+sys_position[idx] = 0;
+#endif
+// Set target direction based on cycle mask and homing cycle approach state.
+// NOTE: This happens to compile smaller than any other implementation tried.
+if (bit_istrue(settings.homing_dir_mask,bit(idx))) {
+if (approach) { target[idx] = -max_travel; }
+else { target[idx] = max_travel; }
+} else {
+if (approach) { target[idx] = max_travel; }
+else { target[idx] = -max_travel; }
+}
+// Apply axislock to the step port pins active in this cycle.
+axislock[idx] = step_pin[idx];
+sys.homing_axis_lock[idx] = axislock[idx];
+}
 
     }
     homing_rate *= sqrt(n_active_axis); // [sqrt(N_AXIS)] Adjust so individual axes all move at homing rate.
@@ -439,31 +467,48 @@ void limits_go_home(uint8_t cycle_mask)
     st_wake_up(); // Initiate motion
     do {
       if (approach) {
-        // Check limit state. Lock out cycle axes when they change.
-        limit_state = limits_get_stateMax();
-        for (idx=0; idx<N_AXIS; idx++) {
-          if (axislock[idx] & step_pin[idx]) {
-            if (limit_state & (1 << idx)) {
-              #ifdef COREXY
-                if (idx==AXIS_3) { axislock[idx] &= ~(step_pin[AXIS_3]); }
-                #if N_AXIS > 3
-                  else if (idx==AXIS_4) { axislock[idx] &= ~(step_pin[AXIS_4]); }
-                #endif
-                #if N_AXIS > 4
-                  else if (idx==AXIS_5) { axislock[idx] &= ~(step_pin[AXIS_5]); }
-                #endif
-                #if N_AXIS > 5
-                  else if (idx==AXIS_6) { axislock[idx] &= ~(step_pin[AXIS_6]); }
-                #endif
-                else { axislock[idx] &= ~(step_pin[A_MOTOR]|step_pin[B_MOTOR]); }
-              #else
-                axislock[idx] &= ~(step_pin[idx]);
-              #endif
-            }
-          }
-          sys.homing_axis_lock[idx] = axislock[idx];
-        }
-      }
+// Check limit state. Lock out cycle axes when they change.
+limit_state = limits_get_stateMax();
+for (idx=0; idx<N_AXIS; idx++) {
+if (axislock[idx] & step_pin[idx]) {
+if (limit_state & (1 << idx)) {
+#ifdef COREXY
+if (idx==AXIS_3) { axislock[idx] &= ~(step_pin[AXIS_3]); }
+#if N_AXIS > 3
+else if (idx==AXIS_4) { axislock[idx] &= ~(step_pin[AXIS_4]); }
+#endif
+#if N_AXIS > 4
+else if (idx==AXIS_5) { axislock[idx] &= ~(step_pin[AXIS_5]); }
+#endif
+#if N_AXIS > 5
+else if (idx==AXIS_6) { axislock[idx] &= ~(step_pin[AXIS_6]); }
+#endif
+else { axislock[idx] &= ~(step_pin[A_MOTOR]|step_pin[B_MOTOR]); }
+#else
+#ifdef COREBC
+if (idx==AXIS_5) { axislock[idx] &= ~(step_pin[AXIS_5]); }
+#if N_AXIS > 5
+else if (idx==AXIS_6) { axislock[idx] &= ~(step_pin[AXIS_6]); }
+#endif
+else { axislock[idx] &= ~(step_pin[E_MOTOR]|step_pin[F_MOTOR]); }
+#else
+axislock[idx] &= ~(step_pin[idx]);
+#endif
+#ifdef COREZA
+if (idx==AXIS_3) { axislock[idx] &= ~(step_pin[AXIS_3]); }
+#if N_AXIS > 5
+else if (idx==AXIS_4) { axislock[idx] &= ~(step_pin[AXIS_4]); }
+#endif
+else { axislock[idx] &= ~(step_pin[C_MOTOR]|step_pin[D_MOTOR]); }
+#else
+axislock[idx] &= ~(step_pin[idx]);
+#endif
+#endif
+}
+}
+sys.homing_axis_lock[idx] = axislock[idx];
+}
+}
 
       st_prep_buffer(); // Check and prep segment buffer. NOTE: Should take no longer than 200us.
 
@@ -543,6 +588,34 @@ void limits_go_home(uint8_t cycle_mask)
         sys_position[idx] = set_axis_position;
       #endif
 
+      #ifdef COREZA
+    if (idx==AXIS_3) {
+      int32_t off_axis_position = system_convert_coreza_to_a_axis_steps(sys_position);
+      sys_position[C_MOTOR] = set_axis_position + off_axis_position;
+      sys_position[D_MOTOR] = set_axis_position - off_axis_position;
+    } else if (idx==AXIS_4) {
+      int32_t off_axis_position = system_convert_coreza_to_z_axis_steps(sys_position);
+      sys_position[C_MOTOR] = off_axis_position + set_axis_position;
+      sys_position[D_MOTOR] = off_axis_position - set_axis_position;
+    } else {
+      sys_position[idx] = set_axis_position;
+    }
+  #endif
+ #ifdef COREBC
+    if (idx==AXIS_5) {
+      int32_t off_axis_position = system_convert_corebc_to_c_axis_steps(sys_position);
+      sys_position[E_MOTOR] = set_axis_position + off_axis_position;
+      sys_position[F_MOTOR] = set_axis_position - off_axis_position;
+    } else if (idx==AXIS_6) {
+      int32_t off_axis_position = system_convert_corebc_to_b_axis_steps(sys_position);
+      sys_position[E_MOTOR] = off_axis_position + set_axis_position;
+      sys_position[F_MOTOR] = off_axis_position - set_axis_position;
+    } else {
+      sys_position[idx] = set_axis_position;
+    }
+  #endif
+
+   
     }
   }
   sys.step_control = STEP_CONTROL_NORMAL_OP; // Return step control to normal operation.

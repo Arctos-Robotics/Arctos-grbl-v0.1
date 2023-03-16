@@ -35,6 +35,17 @@
  #define B_MOTOR AXIS_2 // Must be AXIS_2 (Y)
 #endif
 
+#ifdef COREZA
+ #define C_MOTOR AXIS_3 // Must be AXIS_3 (U)
+ #define D_MOTOR AXIS_4 // Must be AXIS_4 (V)
+#endif
+
+#ifdef COREBC
+ #define E_MOTOR AXIS_5 // Must be AXIS_3 (U)
+ #define F_MOTOR AXIS_6 // Must be AXIS_4 (V)
+#endif
+
+
 // Conversions
 #define MM_PER_INCH (25.40)
 #define INCH_PER_MM (0.0393701)

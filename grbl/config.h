@@ -267,7 +267,8 @@
 // described, if not, motions may move in strange directions. Grbl requires the CoreXY A and B motors
 // have the same steps per mm internally.
 // #define COREXY // Default disabled. Uncomment to enable.
-
+#define COREBC
+#define COREZA
 // Inverts pin logic of the control command pins based on a mask. This essentially means you can use
 // normally-closed switches on the specified pins, rather than the default normally-open switches.
 // NOTE: The top option will mask and invert all control pins. The bottom option is an example of
