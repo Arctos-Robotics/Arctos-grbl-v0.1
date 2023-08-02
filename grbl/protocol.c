@@ -1,11 +1,9 @@
 /*
-  planner.c - buffers movement commands and manages the acceleration profile plan
+  protocol.c - controls Grbl execution protocol and procedures
   Part of Grbl
 
-  Copyright (c) 2017-2018 Gauthier Briere
   Copyright (c) 2011-2016 Sungeun K. Jeon for Gnea Research LLC
   Copyright (c) 2009-2011 Simen Svale Skogsrud
-  Copyright (c) 2011 Jens Geisler
 
   Grbl is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -22,555 +20,743 @@
 */
 
 #include "grbl.h"
-#include "config.h"
-static plan_block_t block_buffer[BLOCK_BUFFER_SIZE];  // A ring buffer for motion instructions
-static uint8_t block_buffer_tail;     // Index of the block to process now
-static uint8_t block_buffer_head;     // Index of the next block to be pushed
-static uint8_t next_buffer_head;      // Index of the next buffer head
-static uint8_t block_buffer_planned;  // Index of the optimally planned block
 
-// Define planner variables
-typedef struct {
-  int32_t position[N_AXIS];          // The planner position of the tool in absolute steps. Kept separate
-                                     // from g-code position for movements requiring multiple line motions,
-                                     // i.e. arcs, canned cycles, and backlash compensation.
-  float previous_unit_vec[N_AXIS];   // Unit vector of previous path line segment
-  float previous_nominal_speed;  // Nominal speed of previous path line segment
-} planner_t;
-static planner_t pl;
+// Define line flags. Includes comment type tracking and line overflow detection.
+#define LINE_FLAG_OVERFLOW bit(0)
+#define LINE_FLAG_COMMENT_PARENTHESES bit(1)
+#define LINE_FLAG_COMMENT_SEMICOLON bit(2)
 
 
-// Returns the index of the next block in the ring buffer. Also called by stepper segment buffer.
-uint8_t plan_next_block_index(uint8_t block_index)
-{
-  block_index++;
-  if (block_index == BLOCK_BUFFER_SIZE) { block_index = 0; }
-  return(block_index);
-}
+static char line[LINE_BUFFER_SIZE]; // Line to be executed. Zero-terminated.
+
+static void protocol_exec_rt_suspend();
 
 
-// Returns the index of the previous block in the ring buffer
-static uint8_t plan_prev_block_index(uint8_t block_index)
-{
-  if (block_index == 0) { block_index = BLOCK_BUFFER_SIZE; }
-  block_index--;
-  return(block_index);
-}
-
-
-/*                            PLANNER SPEED DEFINITION
-                                     +--------+   <- current->nominal_speed
-                                    /          \
-         current->entry_speed ->   +            \
-                                   |             + <- next->entry_speed (aka exit speed)
-                                   +-------------+
-                                       time -->
-
-  Recalculates the motion plan according to the following basic guidelines:
-
-    1. Go over every feasible block sequentially in reverse order and calculate the junction speeds
-        (i.e. current->entry_speed) such that:
-      a. No junction speed exceeds the pre-computed maximum junction speed limit or nominal speeds of
-         neighboring blocks.
-      b. A block entry speed cannot exceed one reverse-computed from its exit speed (next->entry_speed)
-         with a maximum allowable deceleration over the block travel distance.
-      c. The last (or newest appended) block is planned from a complete stop (an exit speed of zero).
-    2. Go over every block in chronological (forward) order and dial down junction speed values if
-      a. The exit speed exceeds the one forward-computed from its entry speed with the maximum allowable
-         acceleration over the block travel distance.
-
-  When these stages are complete, the planner will have maximized the velocity profiles throughout the all
-  of the planner blocks, where every block is operating at its maximum allowable acceleration limits. In
-  other words, for all of the blocks in the planner, the plan is optimal and no further speed improvements
-  are possible. If a new block is added to the buffer, the plan is recomputed according to the said
-  guidelines for a new optimal plan.
-
-  To increase computational efficiency of these guidelines, a set of planner block pointers have been
-  created to indicate stop-compute points for when the planner guidelines cannot logically make any further
-  changes or improvements to the plan when in normal operation and new blocks are streamed and added to the
-  planner buffer. For example, if a subset of sequential blocks in the planner have been planned and are
-  bracketed by junction velocities at their maximums (or by the first planner block as well), no new block
-  added to the planner buffer will alter the velocity profiles within them. So we no longer have to compute
-  them. Or, if a set of sequential blocks from the first block in the planner (or a optimal stop-compute
-  point) are all accelerating, they are all optimal and can not be altered by a new block added to the
-  planner buffer, as this will only further increase the plan speed to chronological blocks until a maximum
-  junction velocity is reached. However, if the operational conditions of the plan changes from infrequently
-  used feed holds or feedrate overrides, the stop-compute pointers will be reset and the entire plan is
-  recomputed as stated in the general guidelines.
-
-  Planner buffer index mapping:
-  - block_buffer_tail: Points to the beginning of the planner buffer. First to be executed or being executed.
-  - block_buffer_head: Points to the buffer block after the last block in the buffer. Used to indicate whether
-      the buffer is full or empty. As described for standard ring buffers, this block is always empty.
-  - next_buffer_head: Points to next planner buffer block after the buffer head block. When equal to the
-      buffer tail, this indicates the buffer is full.
-  - block_buffer_planned: Points to the first buffer block after the last optimally planned block for normal
-      streaming operating conditions. Use for planning optimizations by avoiding recomputing parts of the
-      planner buffer that don't change with the addition of a new block, as describe above. In addition,
-      this block can never be less than block_buffer_tail and will always be pushed forward and maintain
-      this requirement when encountered by the plan_discard_current_block() routine during a cycle.
-
-  NOTE: Since the planner only computes on what's in the planner buffer, some motions with lots of short
-  line segments, like G2/3 arcs or complex curves, may seem to move slow. This is because there simply isn't
-  enough combined distance traveled in the entire buffer to accelerate up to the nominal speed and then
-  decelerate to a complete stop at the end of the buffer, as stated by the guidelines. If this happens and
-  becomes an annoyance, there are a few simple solutions: (1) Maximize the machine acceleration. The planner
-  will be able to compute higher velocity profiles within the same combined distance. (2) Maximize line
-  motion(s) distance per block to a desired tolerance. The more combined distance the planner has to use,
-  the faster it can go. (3) Maximize the planner buffer size. This also will increase the combined distance
-  for the planner to compute over. It also increases the number of computations the planner has to perform
-  to compute an optimal plan, so select carefully. The Arduino 328p memory is already maxed out, but future
-  ARM versions should have enough memory and speed for look-ahead blocks numbering up to a hundred or more.
-
+/*
+  GRBL PRIMARY LOOP:
 */
-static void planner_recalculate()
+void protocol_main_loop()
 {
-  // Initialize block index to the last block in the planner buffer.
-  uint8_t block_index = plan_prev_block_index(block_buffer_head);
+  // Perform some machine checks to make sure everything is good to go.
+  #ifdef CHECK_LIMITS_AT_INIT
+    if (bit_istrue(settings.flags, BITFLAG_HARD_LIMIT_ENABLE)) {
+      if (limits_get_state()) {
+        sys.state = STATE_ALARM; // Ensure alarm state is active.
+        report_feedback_message(MESSAGE_CHECK_LIMITS);
+      }
+    }
+  #endif
+  // Check for and report alarm state after a reset, error, or an initial power up.
+  // NOTE: Sleep mode disables the stepper drivers and position can't be guaranteed.
+  // Re-initialize the sleep state as an ALARM mode to ensure user homes or acknowledges.
+  if (sys.state & (STATE_ALARM | STATE_SLEEP)) {
+    report_feedback_message(MESSAGE_ALARM_LOCK);
+    sys.state = STATE_ALARM; // Ensure alarm state is set.
+  } else {
+    // Check if the safety door is open.
+    sys.state = STATE_IDLE;
+    if (system_check_safety_door_ajar()) {
+      bit_true(sys_rt_exec_state, EXEC_SAFETY_DOOR);
+      protocol_execute_realtime(); // Enter safety door mode. Should return as IDLE state.
+    }
+    // All systems go!
+    system_execute_startup(line); // Execute startup script.
+  }
 
-  // Bail. Can't do anything with one only one plan-able block.
-  if (block_index == block_buffer_planned) { return; }
+  // ---------------------------------------------------------------------------------
+  // Primary loop! Upon a system abort, this exits back to main() to reset the system.
+  // This is also where Grbl idles while waiting for something to do.
+  // ---------------------------------------------------------------------------------
 
-  // Reverse Pass: Coarsely maximize all possible deceleration curves back-planning from the last
-  // block in buffer. Cease planning when the last optimal planned or tail pointer is reached.
-  // NOTE: Forward pass will later refine and correct the reverse pass to create an optimal plan.
-  float entry_speed_sqr;
-  plan_block_t *next;
-  plan_block_t *current = &block_buffer[block_index];
+  uint8_t line_flags = 0;
+  uint8_t char_counter = 0;
+  uint8_t c;
+  for (;;) {
 
-  // Calculate maximum entry speed for last block in buffer, where the exit speed is always zero.
-  current->entry_speed_sqr = min( current->max_entry_speed_sqr, 2*current->acceleration*current->millimeters);
+    // Process one line of incoming serial data, as the data becomes available. Performs an
+    // initial filtering by removing spaces and comments and capitalizing all letters.
+    while((c = serial_read()) != SERIAL_NO_DATA) {
+      if ((c == '\n') || (c == '\r')) { // End of line reached
 
-  block_index = plan_prev_block_index(block_index);
-  if (block_index == block_buffer_planned) { // Only two plannable blocks in buffer. Reverse pass complete.
-    // Check if the first block is the tail. If so, notify stepper to update its current parameters.
-    if (block_index == block_buffer_tail) { st_update_plan_block_parameters(); }
-  } else { // Three or more plan-able blocks
-    while (block_index != block_buffer_planned) {
-      next = current;
-      current = &block_buffer[block_index];
-      block_index = plan_prev_block_index(block_index);
+        protocol_execute_realtime(); // Runtime command check point.
+        if (sys.abort) { return; } // Bail to calling function upon system abort
 
-      // Check if next block is the tail block(=planned block). If so, update current stepper parameters.
-      if (block_index == block_buffer_tail) { st_update_plan_block_parameters(); }
+        line[char_counter] = 0; // Set string termination character.
+        #ifdef REPORT_ECHO_LINE_RECEIVED
+          report_echo_line_received(line);
+        #endif
 
-      // Compute maximum entry speed decelerating over the current block from its exit speed.
-      if (current->entry_speed_sqr != current->max_entry_speed_sqr) {
-        entry_speed_sqr = next->entry_speed_sqr + 2*current->acceleration*current->millimeters;
-        if (entry_speed_sqr < current->max_entry_speed_sqr) {
-          current->entry_speed_sqr = entry_speed_sqr;
+        // Direct and execute one line of formatted input, and report status of execution.
+        if (line_flags & LINE_FLAG_OVERFLOW) {
+          // Report line overflow error.
+          report_status_message(STATUS_OVERFLOW);
+        } else if (line[0] == 0) {
+          // Empty or comment line. For syncing purposes.
+          report_status_message(STATUS_OK);
+        } else if (line[0] == '$') {
+          // Grbl '$' system command
+          report_status_message(system_execute_line(line));
+        } else if (sys.state & (STATE_ALARM | STATE_JOG)) {
+          // Everything else is gcode. Block if in alarm or jog mode.
+          report_status_message(STATUS_SYSTEM_GC_LOCK);
         } else {
-          current->entry_speed_sqr = current->max_entry_speed_sqr;
+          // Parse and execute g-code block.
+          report_status_message(gc_execute_line(line));
+        }
+
+        // Reset tracking data for next line.
+        line_flags = 0;
+        char_counter = 0;
+
+      } else {
+
+        if (line_flags) {
+          // Throw away all (except EOL) comment characters and overflow characters.
+          if (c == ')') {
+            // End of '()' comment. Resume line allowed.
+            if (line_flags & LINE_FLAG_COMMENT_PARENTHESES) { line_flags &= ~(LINE_FLAG_COMMENT_PARENTHESES); }
+          }
+        } else {
+          if (c <= ' ') {
+            // Throw away whitepace and control characters
+          } else if (c == '/') {
+            // Block delete NOT SUPPORTED. Ignore character.
+            // NOTE: If supported, would simply need to check the system if block delete is enabled.
+          } else if (c == '(') {
+            // Enable comments flag and ignore all characters until ')' or EOL.
+            // NOTE: This doesn't follow the NIST definition exactly, but is good enough for now.
+            // In the future, we could simply remove the items within the comments, but retain the
+            // comment control characters, so that the g-code parser can error-check it.
+            line_flags |= LINE_FLAG_COMMENT_PARENTHESES;
+          } else if (c == ';') {
+            // NOTE: ';' comment to EOL is a LinuxCNC definition. Not NIST.
+            line_flags |= LINE_FLAG_COMMENT_SEMICOLON;
+          // TODO: Install '%' feature
+          // } else if (c == '%') {
+            // Program start-end percent sign NOT SUPPORTED.
+            // NOTE: This maybe installed to tell Grbl when a program is running vs manual input,
+            // where, during a program, the system auto-cycle start will continue to execute
+            // everything until the next '%' sign. This will help fix resuming issues with certain
+            // functions that empty the planner buffer to execute its task on-time.
+          } else if (char_counter >= (LINE_BUFFER_SIZE-1)) {
+            // Detect line buffer overflow and set flag.
+            line_flags |= LINE_FLAG_OVERFLOW;
+          } else if (c >= 'a' && c <= 'z') { // Upcase lowercase
+            line[char_counter++] = c-'a'+'A';
+          } else {
+            line[char_counter++] = c;
+          }
+        }
+
+      }
+    }
+
+    // If there are no more characters in the serial read buffer to be processed and executed,
+    // this indicates that g-code streaming has either filled the planner buffer or has
+    // completed. In either case, auto-cycle start, if enabled, any queued moves.
+    protocol_auto_cycle_start();
+
+    protocol_execute_realtime();  // Runtime command check point.
+    if (sys.abort) { return; } // Bail to main() program loop to reset system.
+
+    #ifdef SLEEP_ENABLE
+      // Check for sleep conditions and execute auto-park, if timeout duration elapses.
+      sleep_check();
+    #endif
+  }
+
+  return; /* Never reached */
+}
+
+
+// Block until all buffered steps are executed or in a cycle state. Works with feed hold
+// during a synchronize call, if it should happen. Also, waits for clean cycle end.
+void protocol_buffer_synchronize()
+{
+  // If system is queued, ensure cycle resumes if the auto start flag is present.
+  protocol_auto_cycle_start();
+  do {
+    protocol_execute_realtime();   // Check and execute run-time commands
+    if (sys.abort) { return; } // Check for system abort
+  } while (plan_get_current_block() || (sys.state == STATE_CYCLE));
+}
+
+
+// Auto-cycle start triggers when there is a motion ready to execute and if the main program is not
+// actively parsing commands.
+// NOTE: This function is called from the main loop, buffer sync, and mc_line() only and executes
+// when one of these conditions exist respectively: There are no more blocks sent (i.e. streaming
+// is finished, single commands), a command that needs to wait for the motions in the buffer to
+// execute calls a buffer sync, or the planner buffer is full and ready to go.
+void protocol_auto_cycle_start()
+{
+  if (plan_get_current_block() != NULL) { // Check if there are any blocks in the buffer.
+    system_set_exec_state_flag(EXEC_CYCLE_START); // If so, execute them!
+  }
+}
+
+
+// This function is the general interface to Grbl's real-time command execution system. It is called
+// from various check points in the main program, primarily where there may be a while loop waiting
+// for a buffer to clear space or any point where the execution time from the last check point may
+// be more than a fraction of a second. This is a way to execute realtime commands asynchronously
+// (aka multitasking) with grbl's g-code parsing and planning functions. This function also serves
+// as an interface for the interrupts to set the system realtime flags, where only the main program
+// handles them, removing the need to define more computationally-expensive volatile variables. This
+// also provides a controlled way to execute certain tasks without having two or more instances of
+// the same task, such as the planner recalculating the buffer upon a feedhold or overrides.
+// NOTE: The sys_rt_exec_state variable flags are set by any process, step or serial interrupts, pinouts,
+// limit switches, or the main program.
+void protocol_execute_realtime()
+{
+  protocol_exec_rt_system();
+  if (sys.suspend) { protocol_exec_rt_suspend(); }
+}
+
+
+// Executes run-time commands, when required. This function primarily operates as Grbl's state
+// machine and controls the various real-time features Grbl has to offer.
+// NOTE: Do not alter this unless you know exactly what you are doing!
+void protocol_exec_rt_system()
+{
+  uint8_t rt_exec; // Temp variable to avoid calling volatile multiple times.
+  rt_exec = sys_rt_exec_alarm; // Copy volatile sys_rt_exec_alarm.
+  if (rt_exec) { // Enter only if any bit flag is true
+    // System alarm. Everything has shutdown by something that has gone severely wrong. Report
+    // the source of the error to the user. If critical, Grbl disables by entering an infinite
+    // loop until system reset/abort.
+    sys.state = STATE_ALARM; // Set system alarm state
+    report_alarm_message(rt_exec);
+    // Halt everything upon a critical event flag. Currently hard and soft limits flag this.
+    if ((rt_exec == EXEC_ALARM_HARD_LIMIT) || (rt_exec == EXEC_ALARM_SOFT_LIMIT)) {
+      report_feedback_message(MESSAGE_CRITICAL_EVENT);
+      system_clear_exec_state_flag(EXEC_RESET); // Disable any existing reset
+      do {
+        // Block everything, except reset and status reports, until user issues reset or power
+        // cycles. Hard limits typically occur while unattended or not paying attention. Gives
+        // the user and a GUI time to do what is needed before resetting, like killing the
+        // incoming stream. The same could be said about soft limits. While the position is not
+        // lost, continued streaming could cause a serious crash if by chance it gets executed.
+        if (sys_rt_exec_state & EXEC_STATUS_REPORT) {
+          report_realtime_status();
+          system_clear_exec_state_flag(EXEC_STATUS_REPORT);
+        }
+      } while (bit_isfalse(sys_rt_exec_state,EXEC_RESET));
+    }
+    system_clear_exec_alarm(); // Clear alarm
+  }
+
+  rt_exec = sys_rt_exec_state; // Copy volatile sys_rt_exec_state.
+  if (rt_exec) {
+
+    // Execute system abort.
+    if (rt_exec & EXEC_RESET) {
+      sys.abort = true;  // Only place this is set true.
+      return; // Nothing else to do but exit.
+    }
+
+    // Execute and serial print status
+    if (rt_exec & EXEC_STATUS_REPORT) {
+      report_realtime_status();
+      system_clear_exec_state_flag(EXEC_STATUS_REPORT);
+    }
+
+    // NOTE: Once hold is initiated, the system immediately enters a suspend state to block all
+    // main program processes until either reset or resumed. This ensures a hold completes safely.
+    if (rt_exec & (EXEC_MOTION_CANCEL | EXEC_FEED_HOLD | EXEC_SAFETY_DOOR | EXEC_SLEEP)) {
+
+      // State check for allowable states for hold methods.
+      if (!(sys.state & (STATE_ALARM | STATE_CHECK_MODE))) {
+
+        // If in CYCLE or JOG states, immediately initiate a motion HOLD.
+        if (sys.state & (STATE_CYCLE | STATE_JOG)) {
+          if (!(sys.suspend & (SUSPEND_MOTION_CANCEL | SUSPEND_JOG_CANCEL))) { // Block, if already holding.
+            st_update_plan_block_parameters(); // Notify stepper module to recompute for hold deceleration.
+            sys.step_control = STEP_CONTROL_EXECUTE_HOLD; // Initiate suspend state with active flag.
+            if (sys.state == STATE_JOG) { // Jog cancelled upon any hold event, except for sleeping.
+              if (!(rt_exec & EXEC_SLEEP)) { sys.suspend |= SUSPEND_JOG_CANCEL; }
+            }
+          }
+        }
+        // If IDLE, Grbl is not in motion. Simply indicate suspend state and hold is complete.
+        if (sys.state == STATE_IDLE) { sys.suspend = SUSPEND_HOLD_COMPLETE; }
+
+        // Execute and flag a motion cancel with deceleration and return to idle. Used primarily by probing cycle
+        // to halt and cancel the remainder of the motion.
+        if (rt_exec & EXEC_MOTION_CANCEL) {
+          // MOTION_CANCEL only occurs during a CYCLE, but a HOLD and SAFETY_DOOR may been initiated beforehand
+          // to hold the CYCLE. Motion cancel is valid for a single planner block motion only, while jog cancel
+          // will handle and clear multiple planner block motions.
+          if (!(sys.state & STATE_JOG)) { sys.suspend |= SUSPEND_MOTION_CANCEL; } // NOTE: State is STATE_CYCLE.
+        }
+
+        // Execute a feed hold with deceleration, if required. Then, suspend system.
+        if (rt_exec & EXEC_FEED_HOLD) {
+          // Block SAFETY_DOOR, JOG, and SLEEP states from changing to HOLD state.
+          if (!(sys.state & (STATE_SAFETY_DOOR | STATE_JOG | STATE_SLEEP))) { sys.state = STATE_HOLD; }
+        }
+
+        // Execute a safety door stop with a feed hold and disable spindle/coolant.
+        // NOTE: Safety door differs from feed holds by stopping everything no matter state, disables powered
+        // devices (spindle/coolant), and blocks resuming until switch is re-engaged.
+        if (rt_exec & EXEC_SAFETY_DOOR) {
+          report_feedback_message(MESSAGE_SAFETY_DOOR_AJAR);
+          // If jogging, block safety door methods until jog cancel is complete. Just flag that it happened.
+          if (!(sys.suspend & SUSPEND_JOG_CANCEL)) {
+            // Check if the safety re-opened during a restore parking motion only. Ignore if
+            // already retracting, parked or in sleep state.
+            if (sys.state == STATE_SAFETY_DOOR) {
+              if (sys.suspend & SUSPEND_INITIATE_RESTORE) { // Actively restoring
+                #ifdef PARKING_ENABLE
+                  // Set hold and reset appropriate control flags to restart parking sequence.
+                  if (sys.step_control & STEP_CONTROL_EXECUTE_SYS_MOTION) {
+                    st_update_plan_block_parameters(); // Notify stepper module to recompute for hold deceleration.
+                    sys.step_control = (STEP_CONTROL_EXECUTE_HOLD | STEP_CONTROL_EXECUTE_SYS_MOTION);
+                    sys.suspend &= ~(SUSPEND_HOLD_COMPLETE);
+                  } // else NO_MOTION is active.
+                #endif
+                sys.suspend &= ~(SUSPEND_RETRACT_COMPLETE | SUSPEND_INITIATE_RESTORE | SUSPEND_RESTORE_COMPLETE);
+                sys.suspend |= SUSPEND_RESTART_RETRACT;
+              }
+            }
+            if (sys.state != STATE_SLEEP) { sys.state = STATE_SAFETY_DOOR; }
+          }
+          // NOTE: This flag doesn't change when the door closes, unlike sys.state. Ensures any parking motions
+          // are executed if the door switch closes and the state returns to HOLD.
+          sys.suspend |= SUSPEND_SAFETY_DOOR_AJAR;
+        }
+
+      }
+
+      if (rt_exec & EXEC_SLEEP) {
+        if (sys.state == STATE_ALARM) { sys.suspend |= (SUSPEND_RETRACT_COMPLETE|SUSPEND_HOLD_COMPLETE); }
+        sys.state = STATE_SLEEP;
+      }
+
+      system_clear_exec_state_flag((EXEC_MOTION_CANCEL | EXEC_FEED_HOLD | EXEC_SAFETY_DOOR | EXEC_SLEEP));
+    }
+
+    // Execute a cycle start by starting the stepper interrupt to begin executing the blocks in queue.
+    if (rt_exec & EXEC_CYCLE_START) {
+      // Block if called at same time as the hold commands: feed hold, motion cancel, and safety door.
+      // Ensures auto-cycle-start doesn't resume a hold without an explicit user-input.
+      if (!(rt_exec & (EXEC_FEED_HOLD | EXEC_MOTION_CANCEL | EXEC_SAFETY_DOOR))) {
+        // Resume door state when parking motion has retracted and door has been closed.
+        if ((sys.state == STATE_SAFETY_DOOR) && !(sys.suspend & SUSPEND_SAFETY_DOOR_AJAR)) {
+          if (sys.suspend & SUSPEND_RESTORE_COMPLETE) {
+            sys.state = STATE_IDLE; // Set to IDLE to immediately resume the cycle.
+          } else if (sys.suspend & SUSPEND_RETRACT_COMPLETE) {
+            // Flag to re-energize powered components and restore original position, if disabled by SAFETY_DOOR.
+            // NOTE: For a safety door to resume, the switch must be closed, as indicated by HOLD state, and
+            // the retraction execution is complete, which implies the initial feed hold is not active. To
+            // restore normal operation, the restore procedures must be initiated by the following flag. Once,
+            // they are complete, it will call CYCLE_START automatically to resume and exit the suspend.
+            sys.suspend |= SUSPEND_INITIATE_RESTORE;
+          }
+        }
+        // Cycle start only when IDLE or when a hold is complete and ready to resume.
+        if ((sys.state == STATE_IDLE) || ((sys.state & STATE_HOLD) && (sys.suspend & SUSPEND_HOLD_COMPLETE))) {
+          if (sys.state == STATE_HOLD && sys.spindle_stop_ovr) {
+            sys.spindle_stop_ovr |= SPINDLE_STOP_OVR_RESTORE_CYCLE; // Set to restore in suspend routine and cycle start after.
+          } else {
+            // Start cycle only if queued motions exist in planner buffer and the motion is not canceled.
+            sys.step_control = STEP_CONTROL_NORMAL_OP; // Restore step control to normal operation
+            if (plan_get_current_block() && bit_isfalse(sys.suspend,SUSPEND_MOTION_CANCEL)) {
+              sys.suspend = SUSPEND_DISABLE; // Break suspend state.
+              sys.state = STATE_CYCLE;
+              st_prep_buffer(); // Initialize step segment buffer before beginning cycle.
+              st_wake_up();
+            } else { // Otherwise, do nothing. Set and resume IDLE state.
+              sys.suspend = SUSPEND_DISABLE; // Break suspend state.
+              sys.state = STATE_IDLE;
+            }
+          }
         }
       }
-    }
-  }
-
-  // Forward Pass: Forward plan the acceleration curve from the planned pointer onward.
-  // Also scans for optimal plan breakpoints and appropriately updates the planned pointer.
-  next = &block_buffer[block_buffer_planned]; // Begin at buffer planned pointer
-  block_index = plan_next_block_index(block_buffer_planned);
-  while (block_index != block_buffer_head) {
-    current = next;
-    next = &block_buffer[block_index];
-
-    // Any acceleration detected in the forward pass automatically moves the optimal planned
-    // pointer forward, since everything before this is all optimal. In other words, nothing
-    // can improve the plan from the buffer tail to the planned pointer by logic.
-    if (current->entry_speed_sqr < next->entry_speed_sqr) {
-      entry_speed_sqr = current->entry_speed_sqr + 2*current->acceleration*current->millimeters;
-      // If true, current block is full-acceleration and we can move the planned pointer forward.
-      if (entry_speed_sqr < next->entry_speed_sqr) {
-        next->entry_speed_sqr = entry_speed_sqr; // Always <= max_entry_speed_sqr. Backward pass sets this.
-        block_buffer_planned = block_index; // Set optimal plan pointer.
-      }
+      system_clear_exec_state_flag(EXEC_CYCLE_START);
     }
 
-    // Any block set at its maximum entry speed also creates an optimal plan up to this
-    // point in the buffer. When the plan is bracketed by either the beginning of the
-    // buffer and a maximum entry speed or two maximum entry speeds, every block in between
-    // cannot logically be further improved. Hence, we don't have to recompute them anymore.
-    if (next->entry_speed_sqr == next->max_entry_speed_sqr) { block_buffer_planned = block_index; }
-    block_index = plan_next_block_index( block_index );
-  }
-}
-
-
-void plan_reset()
-{
-  memset(&pl, 0, sizeof(planner_t)); // Clear planner struct
-  plan_reset_buffer();
-}
-
-
-void plan_reset_buffer()
-{
-  block_buffer_tail = 0;
-  block_buffer_head = 0; // Empty = tail
-  next_buffer_head = 1; // plan_next_block_index(block_buffer_head)
-  block_buffer_planned = 0; // = block_buffer_tail;
-}
-
-
-void plan_discard_current_block()
-{
-  if (block_buffer_head != block_buffer_tail) { // Discard non-empty buffer.
-    uint8_t block_index = plan_next_block_index( block_buffer_tail );
-    // Push block_buffer_planned pointer, if encountered.
-    if (block_buffer_tail == block_buffer_planned) { block_buffer_planned = block_index; }
-    block_buffer_tail = block_index;
-  }
-}
-
-
-// Returns address of planner buffer block used by system motions. Called by segment generator.
-plan_block_t *plan_get_system_motion_block()
-{
-  return(&block_buffer[block_buffer_head]);
-}
-
-
-// Returns address of first planner block, if available. Called by various main program functions.
-plan_block_t *plan_get_current_block()
-{
-  if (block_buffer_head == block_buffer_tail) { return(NULL); } // Buffer empty
-  return(&block_buffer[block_buffer_tail]);
-}
-
-
-float plan_get_exec_block_exit_speed_sqr()
-{
-  uint8_t block_index = plan_next_block_index(block_buffer_tail);
-  if (block_index == block_buffer_head) { return( 0.0 ); }
-  return( block_buffer[block_index].entry_speed_sqr );
-}
-
-
-// Returns the availability status of the block ring buffer. True, if full.
-uint8_t plan_check_full_buffer()
-{
-  if (block_buffer_tail == next_buffer_head) { return(true); }
-  return(false);
-}
-
-
-// Computes and returns block nominal speed based on running condition and override values.
-// NOTE: All system motion commands, such as homing/parking, are not subject to overrides.
-float plan_compute_profile_nominal_speed(plan_block_t *block)
-{
-  float nominal_speed = block->programmed_rate;
-  if (block->condition & PL_COND_FLAG_RAPID_MOTION) { nominal_speed *= (0.01*sys.r_override); }
-  else {
-    if (!(block->condition & PL_COND_FLAG_NO_FEED_OVERRIDE)) { nominal_speed *= (0.01*sys.f_override); }
-    if (nominal_speed > block->rapid_rate) { nominal_speed = block->rapid_rate; }
-  }
-  if (nominal_speed > MINIMUM_FEED_RATE) { return(nominal_speed); }
-  return(MINIMUM_FEED_RATE);
-}
-
-
-// Computes and updates the max entry speed (sqr) of the block, based on the minimum of the junction's
-// previous and current nominal speeds and max junction speed.
-static void plan_compute_profile_parameters(plan_block_t *block, float nominal_speed, float prev_nominal_speed)
-{
-  // Compute the junction maximum entry based on the minimum of the junction speed and neighboring nominal speeds.
-  if (nominal_speed > prev_nominal_speed) { block->max_entry_speed_sqr = prev_nominal_speed*prev_nominal_speed; }
-  else { block->max_entry_speed_sqr = nominal_speed*nominal_speed; }
-  if (block->max_entry_speed_sqr > block->max_junction_speed_sqr) { block->max_entry_speed_sqr = block->max_junction_speed_sqr; }
-}
-
-
-// Re-calculates buffered motions profile parameters upon a motion-based override change.
-void plan_update_velocity_profile_parameters()
-{
-  uint8_t block_index = block_buffer_tail;
-  plan_block_t *block;
-  float nominal_speed;
-  float prev_nominal_speed = SOME_LARGE_VALUE; // Set high for first block nominal speed calculation.
-  while (block_index != block_buffer_head) {
-    block = &block_buffer[block_index];
-    nominal_speed = plan_compute_profile_nominal_speed(block);
-    plan_compute_profile_parameters(block, nominal_speed, prev_nominal_speed);
-    prev_nominal_speed = nominal_speed;
-    block_index = plan_next_block_index(block_index);
-  }
-  pl.previous_nominal_speed = prev_nominal_speed; // Update prev nominal speed for next incoming block.
-}
-
-
-/* Add a new linear movement to the buffer. target[N_AXIS] is the signed, absolute target position
-   in millimeters. Feed rate specifies the speed of the motion. If feed rate is inverted, the feed
-   rate is taken to mean "frequency" and would complete the operation in 1/feed_rate minutes.
-   All position data passed to the planner must be in terms of machine position to keep the planner
-   independent of any coordinate system changes and offsets, which are handled by the g-code parser.
-   NOTE: Assumes buffer is available. Buffer checks are handled at a higher level by motion_control.
-   In other words, the buffer head is never equal to the buffer tail.  Also the feed rate input value
-   is used in three ways: as a normal feed rate if invert_feed_rate is false, as inverse time if
-   invert_feed_rate is true, or as seek/rapids rate if the feed_rate value is negative (and
-   invert_feed_rate always false).
-   The system motion condition tells the planner to plan a motion in the always unused block buffer
-   head. It avoids changing the planner state and preserves the buffer to ensure subsequent gcode
-   motions are still planned correctly, while the stepper module only points to the block buffer head
-   to execute the special system motion. */
-uint8_t plan_buffer_line(float *target, plan_line_data_t *pl_data)
-{
-  // Prepare and initialize new block. Copy relevant pl_data for block execution.
-  plan_block_t *block = &block_buffer[block_buffer_head];
-  memset(block,0,sizeof(plan_block_t)); // Zero all block values.
-  block->condition = pl_data->condition;
-  block->spindle_speed = pl_data->spindle_speed;
-  block->line_number = pl_data->line_number;
-
-  // Compute and store initial move distance data.
-  int32_t target_steps[N_AXIS], position_steps[N_AXIS];
-  float unit_vec[N_AXIS], delta_mm;
-  uint8_t idx;
-
-  // Copy position data based on type of motion being planned.
- if (block->condition & PL_COND_FLAG_SYSTEM_MOTION) {
-    #if defined(COREXY) || defined(COREBC) || defined(COREZA)
-      #ifdef COREXY
-        position_steps[AXIS_1] = system_convert_corexy_to_x_axis_steps(sys_position);
-        position_steps[AXIS_2] = system_convert_corexy_to_y_axis_steps(sys_position);
-      #endif
-      #ifdef COREZA
-        position_steps[AXIS_3] = system_convert_coreza_to_z_axis_steps(sys_position);
-        position_steps[AXIS_4] = system_convert_coreza_to_a_axis_steps(sys_position);
-      #endif
-      #ifdef COREBC
-        position_steps[AXIS_5] = system_convert_corebc_to_b_axis_steps(sys_position);
-        position_steps[AXIS_6] = system_convert_corebc_to_c_axis_steps(sys_position);
-      #endif
-      
-    #else
-      memcpy(position_steps, sys_position, sizeof(sys_position));
-    #endif
-  } else { memcpy(position_steps, pl.position, sizeof(pl.position)); }
-
-  #ifdef COREXY
-    target_steps[A_MOTOR] = lround(target[A_MOTOR]*settings.steps_per_mm[A_MOTOR]);
-    target_steps[B_MOTOR] = lround(target[B_MOTOR]*settings.steps_per_mm[B_MOTOR]);
-    block->steps[A_MOTOR] = labs((target_steps[AXIS_1]-position_steps[AXIS_1]) + (target_steps[AXIS_2]-position_steps[AXIS_2]));
-    block->steps[B_MOTOR] = labs((target_steps[AXIS_1]-position_steps[AXIS_1]) - (target_steps[AXIS_2]-position_steps[AXIS_2]));
-  #endif
-#ifdef COREZA
-    target_steps[C_MOTOR] = lround(target[C_MOTOR]*settings.steps_per_mm[C_MOTOR]);
-    target_steps[D_MOTOR] = lround(target[D_MOTOR]*settings.steps_per_mm[D_MOTOR]);
-    block->steps[C_MOTOR] = labs((target_steps[AXIS_3]-position_steps[AXIS_3]));
-    block->steps[D_MOTOR] = labs((target_steps[AXIS_3]/24-position_steps[AXIS_3]/24) - (target_steps[AXIS_4]-position_steps[AXIS_4]));
-  #endif
-  #ifdef COREBC
-    target_steps[E_MOTOR] = lround(target[E_MOTOR]*settings.steps_per_mm[E_MOTOR]);
-    target_steps[F_MOTOR] = lround(target[F_MOTOR]*settings.steps_per_mm[F_MOTOR]);
-    block->steps[E_MOTOR] = labs((target_steps[AXIS_5]-position_steps[AXIS_5]) + (target_steps[AXIS_6]-position_steps[AXIS_6]));
-    block->steps[F_MOTOR] = labs((target_steps[AXIS_5]-position_steps[AXIS_5]) - (target_steps[AXIS_6]-position_steps[AXIS_6]));
-  #endif
-  
-
-
- for (idx=0; idx<N_AXIS; idx++) {
-    // Calculate target position in absolute steps, number of steps for each axis, and determine max step events.
-    // Also, compute individual axes distance for move and prep unit vector calculations.
-    // NOTE: Computes true distance from converted step values.
-    #ifdef COREXY
-  if ( !(idx == A_MOTOR) && !(idx == B_MOTOR) ) {
-    target_steps[idx] = lround(target[idx]*settings.steps_per_mm[idx]);
-    block->steps[idx] = labs(target_steps[idx]-position_steps[idx]);
-  }
-  block->step_event_count = max(block->step_event_count, block->steps[idx]);
-  if (idx == A_MOTOR) {
-    delta_mm = (target_steps[AXIS_1]-position_steps[AXIS_1] + target_steps[AXIS_2]-position_steps[AXIS_2])/settings.steps_per_mm[idx];
-  } else if (idx == B_MOTOR) {
-    delta_mm = (target_steps[AXIS_1]-position_steps[AXIS_1] - target_steps[AXIS_2]+position_steps[AXIS_2])/settings.steps_per_mm[idx];
-  } else {
-    delta_mm = (target_steps[idx] - position_steps[idx])/settings.steps_per_mm[idx];
-  }
-#elif defined(COREBC) || defined(COREZA)
-  if ( !(idx == E_MOTOR) && !(idx == F_MOTOR) && !(idx == C_MOTOR) && !(idx == D_MOTOR)) {
-    target_steps[idx] = lround(target[idx]*settings.steps_per_mm[idx]);
-    block->steps[idx] = labs(target_steps[idx]-position_steps[idx]);
-  }
-  block->step_event_count = max(block->step_event_count, block->steps[idx]);
-  if (idx == E_MOTOR) {
-    delta_mm = (target_steps[AXIS_5]-position_steps[AXIS_5] + target_steps[AXIS_6]-position_steps[AXIS_6])/settings.steps_per_mm[idx];
-  } else if (idx == F_MOTOR) {
-    delta_mm = (target_steps[AXIS_5]-position_steps[AXIS_5] - target_steps[AXIS_6]+position_steps[AXIS_6])/settings.steps_per_mm[idx];
-  } else if (idx == C_MOTOR) {
-    delta_mm = (target_steps[AXIS_3]-position_steps[AXIS_3] + target_steps[AXIS_4]-position_steps[AXIS_4])/settings.steps_per_mm[idx];
-  } else if (idx == D_MOTOR) {
-    delta_mm = (target_steps[AXIS_3]-position_steps[AXIS_3] - target_steps[AXIS_4]+position_steps[AXIS_4])/settings.steps_per_mm[idx];
-  } else {
-    delta_mm = (target_steps[idx] - position_steps[idx])/settings.steps_per_mm[idx];
-  }
-
-
-    #else
-      target_steps[idx] = lround(target[idx]*settings.steps_per_mm[idx]);
-      block->steps[idx] = labs(target_steps[idx]-position_steps[idx]);
-      block->step_event_count = max(block->step_event_count, block->steps[idx]);
-      delta_mm = (target_steps[idx] - position_steps[idx])/settings.steps_per_mm[idx];
-
-  #endif
-
-
-
-   
-    unit_vec[idx] = delta_mm; // Store unit vector numerator
-
-    // Set direction bits. Bit enabled always means direction is negative.
-    if (delta_mm < 0.0 ) { block->direction_bits[idx] |= get_direction_pin_mask(idx); }
-  }
-
-  // Bail if this is a zero-length block. Highly unlikely to occur.
-  if (block->step_event_count == 0) { return(PLAN_EMPTY_BLOCK); }
-
-  // Calculate the unit vector of the line move and the block maximum feed rate and acceleration scaled
-  // down such that no individual axes maximum values are exceeded with respect to the line direction.
-  // NOTE: This calculation assumes all axes are orthogonal (Cartesian) and works with ABC-axes,
-  // if they are also orthogonal/independent. Operates on the absolute value of the unit vector.
-  block->millimeters = convert_delta_vector_to_unit_vector(unit_vec);
-  block->acceleration = limit_value_by_axis_maximum(settings.acceleration, unit_vec);
-  block->rapid_rate = limit_value_by_axis_maximum(settings.max_rate, unit_vec);
-
-  // Store programmed rate.
-  if (block->condition & PL_COND_FLAG_RAPID_MOTION) { block->programmed_rate = block->rapid_rate; }
-  else {
-    block->programmed_rate = pl_data->feed_rate;
-    if (block->condition & PL_COND_FLAG_INVERSE_TIME) { block->programmed_rate *= block->millimeters; }
-  }
-
-  // TODO: Need to check this method handling zero junction speeds when starting from rest.
-  if ((block_buffer_head == block_buffer_tail) || (block->condition & PL_COND_FLAG_SYSTEM_MOTION)) {
-
-    // Initialize block entry speed as zero. Assume it will be starting from rest. Planner will correct this later.
-    // If system motion, the system motion block always is assumed to start from rest and end at a complete stop.
-    block->entry_speed_sqr = 0.0;
-    block->max_junction_speed_sqr = 0.0; // Starting from rest. Enforce start from zero velocity.
-
-  } else {
-    // Compute maximum allowable entry speed at junction by centripetal acceleration approximation.
-    // Let a circle be tangent to both previous and current path line segments, where the junction
-    // deviation is defined as the distance from the junction to the closest edge of the circle,
-    // colinear with the circle center. The circular segment joining the two paths represents the
-    // path of centripetal acceleration. Solve for max velocity based on max acceleration about the
-    // radius of the circle, defined indirectly by junction deviation. This may be also viewed as
-    // path width or max_jerk in the previous Grbl version. This approach does not actually deviate
-    // from path, but used as a robust way to compute cornering speeds, as it takes into account the
-    // nonlinearities of both the junction angle and junction velocity.
-    //
-    // NOTE: If the junction deviation value is finite, Grbl executes the motions in an exact path
-    // mode (G61). If the junction deviation value is zero, Grbl will execute the motion in an exact
-    // stop mode (G61.1) manner. In the future, if continuous mode (G64) is desired, the math here
-    // is exactly the same. Instead of motioning all the way to junction point, the machine will
-    // just follow the arc circle defined here. The Arduino doesn't have the CPU cycles to perform
-    // a continuous mode path, but ARM-based microcontrollers most certainly do.
-    //
-    // NOTE: The max junction speed is a fixed value, since machine acceleration limits cannot be
-    // changed dynamically during operation nor can the line move geometry. This must be kept in
-    // memory in the event of a feedrate override changing the nominal speeds of blocks, which can
-    // change the overall maximum entry speed conditions of all blocks.
-
-    float junction_unit_vec[N_AXIS];
-    float junction_cos_theta = 0.0;
-    for (idx=0; idx<N_AXIS; idx++) {
-      junction_cos_theta -= pl.previous_unit_vec[idx]*unit_vec[idx];
-      junction_unit_vec[idx] = unit_vec[idx]-pl.previous_unit_vec[idx];
-    }
-
-    // NOTE: Computed without any expensive trig, sin() or acos(), by trig half angle identity of cos(theta).
-    if (junction_cos_theta > 0.999999) {
-      //  For a 0 degree acute junction, just set minimum junction speed.
-      block->max_junction_speed_sqr = MINIMUM_JUNCTION_SPEED*MINIMUM_JUNCTION_SPEED;
-    } else {
-      if (junction_cos_theta < -0.999999) {
-        // Junction is a straight line or 180 degrees. Junction speed is infinite.
-        block->max_junction_speed_sqr = SOME_LARGE_VALUE;
+    if (rt_exec & EXEC_CYCLE_STOP) {
+      // Reinitializes the cycle plan and stepper system after a feed hold for a resume. Called by
+      // realtime command execution in the main program, ensuring that the planner re-plans safely.
+      // NOTE: Bresenham algorithm variables are still maintained through both the planner and stepper
+      // cycle reinitializations. The stepper path should continue exactly as if nothing has happened.
+      // NOTE: EXEC_CYCLE_STOP is set by the stepper subsystem when a cycle or feed hold completes.
+      if ((sys.state & (STATE_HOLD|STATE_SAFETY_DOOR|STATE_SLEEP)) && !(sys.soft_limit) && !(sys.suspend & SUSPEND_JOG_CANCEL)) {
+        // Hold complete. Set to indicate ready to resume.  Remain in HOLD or DOOR states until user
+        // has issued a resume command or reset.
+        plan_cycle_reinitialize();
+        if (sys.step_control & STEP_CONTROL_EXECUTE_HOLD) { sys.suspend |= SUSPEND_HOLD_COMPLETE; }
+        bit_false(sys.step_control,(STEP_CONTROL_EXECUTE_HOLD | STEP_CONTROL_EXECUTE_SYS_MOTION));
       } else {
-        convert_delta_vector_to_unit_vector(junction_unit_vec);
-        float junction_acceleration = limit_value_by_axis_maximum(settings.acceleration, junction_unit_vec);
-        float sin_theta_d2 = sqrt(0.5*(1.0-junction_cos_theta)); // Trig half angle identity. Always positive.
-        block->max_junction_speed_sqr = max( MINIMUM_JUNCTION_SPEED*MINIMUM_JUNCTION_SPEED,
-                       (junction_acceleration * settings.junction_deviation * sin_theta_d2)/(1.0-sin_theta_d2) );
+        // Motion complete. Includes CYCLE/JOG/HOMING states and jog cancel/motion cancel/soft limit events.
+        // NOTE: Motion and jog cancel both immediately return to idle after the hold completes.
+        if (sys.suspend & SUSPEND_JOG_CANCEL) {   // For jog cancel, flush buffers and sync positions.
+          sys.step_control = STEP_CONTROL_NORMAL_OP;
+          plan_reset();
+          st_reset();
+          gc_sync_position();
+          plan_sync_position();
+        }
+        if (sys.suspend & SUSPEND_SAFETY_DOOR_AJAR) { // Only occurs when safety door opens during jog.
+          sys.suspend &= ~(SUSPEND_JOG_CANCEL);
+          sys.suspend |= SUSPEND_HOLD_COMPLETE;
+          sys.state = STATE_SAFETY_DOOR;
+        } else {
+          sys.suspend = SUSPEND_DISABLE;
+          sys.state = STATE_IDLE;
+        }
+      }
+      system_clear_exec_state_flag(EXEC_CYCLE_STOP);
+    }
+  }
+
+  // Execute overrides.
+  rt_exec = sys_rt_exec_motion_override; // Copy volatile sys_rt_exec_motion_override
+  if (rt_exec) {
+    system_clear_exec_motion_overrides(); // Clear all motion override flags.
+
+    uint8_t new_f_override =  sys.f_override;
+    if (rt_exec & EXEC_FEED_OVR_RESET) { new_f_override = DEFAULT_FEED_OVERRIDE; }
+    if (rt_exec & EXEC_FEED_OVR_COARSE_PLUS) { new_f_override += FEED_OVERRIDE_COARSE_INCREMENT; }
+    if (rt_exec & EXEC_FEED_OVR_COARSE_MINUS) { new_f_override -= FEED_OVERRIDE_COARSE_INCREMENT; }
+    if (rt_exec & EXEC_FEED_OVR_FINE_PLUS) { new_f_override += FEED_OVERRIDE_FINE_INCREMENT; }
+    if (rt_exec & EXEC_FEED_OVR_FINE_MINUS) { new_f_override -= FEED_OVERRIDE_FINE_INCREMENT; }
+    new_f_override = min(new_f_override,MAX_FEED_RATE_OVERRIDE);
+    new_f_override = max(new_f_override,MIN_FEED_RATE_OVERRIDE);
+
+    uint8_t new_r_override = sys.r_override;
+    if (rt_exec & EXEC_RAPID_OVR_RESET) { new_r_override = DEFAULT_RAPID_OVERRIDE; }
+    if (rt_exec & EXEC_RAPID_OVR_MEDIUM) { new_r_override = RAPID_OVERRIDE_MEDIUM; }
+    if (rt_exec & EXEC_RAPID_OVR_LOW) { new_r_override = RAPID_OVERRIDE_LOW; }
+
+    if ((new_f_override != sys.f_override) || (new_r_override != sys.r_override)) {
+      sys.f_override = new_f_override;
+      sys.r_override = new_r_override;
+      sys.report_ovr_counter = 0; // Set to report change immediately
+      plan_update_velocity_profile_parameters();
+      plan_cycle_reinitialize();
+    }
+  }
+
+  rt_exec = sys_rt_exec_accessory_override;
+  if (rt_exec) {
+    system_clear_exec_accessory_overrides(); // Clear all accessory override flags.
+
+    // NOTE: Unlike motion overrides, spindle overrides do not require a planner reinitialization.
+    uint8_t last_s_override =  sys.spindle_speed_ovr;
+    if (rt_exec & EXEC_SPINDLE_OVR_RESET) { last_s_override = DEFAULT_SPINDLE_SPEED_OVERRIDE; }
+    if (rt_exec & EXEC_SPINDLE_OVR_COARSE_PLUS) { last_s_override += SPINDLE_OVERRIDE_COARSE_INCREMENT; }
+    if (rt_exec & EXEC_SPINDLE_OVR_COARSE_MINUS) { last_s_override -= SPINDLE_OVERRIDE_COARSE_INCREMENT; }
+    if (rt_exec & EXEC_SPINDLE_OVR_FINE_PLUS) { last_s_override += SPINDLE_OVERRIDE_FINE_INCREMENT; }
+    if (rt_exec & EXEC_SPINDLE_OVR_FINE_MINUS) { last_s_override -= SPINDLE_OVERRIDE_FINE_INCREMENT; }
+    last_s_override = min(last_s_override,MAX_SPINDLE_SPEED_OVERRIDE);
+    last_s_override = max(last_s_override,MIN_SPINDLE_SPEED_OVERRIDE);
+
+    if (last_s_override != sys.spindle_speed_ovr) {
+      sys.spindle_speed_ovr = last_s_override;
+      // NOTE: Spindle speed overrides during HOLD state are taken care of by suspend function.
+      if (sys.state == STATE_IDLE) { spindle_set_state(gc_state.modal.spindle, gc_state.spindle_speed); }
+			else { bit_true(sys.step_control, STEP_CONTROL_UPDATE_SPINDLE_PWM); }
+      sys.report_ovr_counter = 0; // Set to report change immediately
+    }
+
+    if (rt_exec & EXEC_SPINDLE_OVR_STOP) {
+      // Spindle stop override allowed only while in HOLD state.
+      // NOTE: Report counters are set in spindle_set_state() when spindle stop is executed.
+      if (sys.state == STATE_HOLD) {
+        if (!(sys.spindle_stop_ovr)) { sys.spindle_stop_ovr = SPINDLE_STOP_OVR_INITIATE; }
+        else if (sys.spindle_stop_ovr & SPINDLE_STOP_OVR_ENABLED) { sys.spindle_stop_ovr |= SPINDLE_STOP_OVR_RESTORE; }
+      }
+    }
+
+    // NOTE: Since coolant state always performs a planner sync whenever it changes, the current
+    // run state can be determined by checking the parser state.
+    // NOTE: Coolant overrides only operate during IDLE, CYCLE, HOLD, and JOG states. Ignored otherwise.																										
+    if (rt_exec & (EXEC_COOLANT_FLOOD_OVR_TOGGLE | EXEC_COOLANT_MIST_OVR_TOGGLE)) {
+      if ((sys.state == STATE_IDLE) || (sys.state & (STATE_CYCLE | STATE_HOLD | STATE_JOG))) {
+        uint8_t coolant_state = gc_state.modal.coolant;
+        if (rt_exec & EXEC_COOLANT_MIST_OVR_TOGGLE) {
+          if (coolant_state & COOLANT_MIST_ENABLE) { bit_false(coolant_state,COOLANT_MIST_ENABLE); }
+          else { coolant_state |= COOLANT_MIST_ENABLE; }
+        }
+        if (rt_exec & EXEC_COOLANT_FLOOD_OVR_TOGGLE) {
+          if (coolant_state & COOLANT_FLOOD_ENABLE) { bit_false(coolant_state,COOLANT_FLOOD_ENABLE); }
+          else { coolant_state |= COOLANT_FLOOD_ENABLE; }
+        }
+        coolant_set_state(coolant_state); // Report counter set in coolant_set_state().
+        gc_state.modal.coolant = coolant_state;
       }
     }
   }
 
-
-  float steps_to_subtract = (target_steps[AXIS_3] / 24.0) - (position_steps[AXIS_3] / 24.0);
-pl.position[AXIS_3] -= steps_to_subtract;
-
-// Update previous path unit_vector and planner position.
-memcpy(pl.previous_unit_vec, unit_vec, sizeof(unit_vec)); // pl.previous_unit_vec[] = unit_vec[]
-memcpy(pl.position, target_steps, sizeof(target_steps)); // pl.position[] = target_steps[]
-
-
-  // Block system motion from updating this data to ensure next g-code motion is computed correctly.
-  if (!(block->condition & PL_COND_FLAG_SYSTEM_MOTION)) {
-    float nominal_speed = plan_compute_profile_nominal_speed(block);
-    plan_compute_profile_parameters(block, nominal_speed, pl.previous_nominal_speed);
-    pl.previous_nominal_speed = nominal_speed;
-
-    // Update previous path unit_vector and planner position.
-    memcpy(pl.previous_unit_vec, unit_vec, sizeof(unit_vec)); // pl.previous_unit_vec[] = unit_vec[]
-    memcpy(pl.position, target_steps, sizeof(target_steps)); // pl.position[] = target_steps[]
-
-    // New block is all set. Update buffer head and next buffer head indices.
-    block_buffer_head = next_buffer_head;
-    next_buffer_head = plan_next_block_index(block_buffer_head);
-
-    // Finish up by recalculating the plan with the new block.
-    planner_recalculate();
+  // Reload step segment buffer
+  if (sys.state & (STATE_CYCLE | STATE_HOLD | STATE_SAFETY_DOOR | STATE_HOMING | STATE_SLEEP| STATE_JOG)) {
+    st_prep_buffer();
   }
-  return(PLAN_OK);
+
 }
 
 
-// Reset the planner position vectors. Called by the system abort/initialization routine.
-void plan_sync_position()
+// Handles Grbl system suspend procedures, such as feed hold, safety door, and parking motion.
+// The system will enter this loop, create local variables for suspend tasks, and return to
+// whatever function that invoked the suspend, such that Grbl resumes normal operation.
+// This function is written in a way to promote custom parking motions. Simply use this as a
+// template
+static void protocol_exec_rt_suspend()
 {
-  // TODO: For motor configurations not in the same coordinate frame as the machine position,
-  // this function needs to be updated to accomodate the difference.
-  uint8_t idx;
-  for (idx=0; idx<N_AXIS; idx++) {
-    #ifdef COREXY
-      if (idx==AXIS_1) {
-        pl.position[AXIS_1] = system_convert_corexy_to_x_axis_steps(sys_position);
-      } else if (idx==AXIS_2) {
-        pl.position[AXIS_2] = system_convert_corexy_to_y_axis_steps(sys_position);
+  #ifdef PARKING_ENABLE
+    // Declare and initialize parking local variables
+    float restore_target[N_AXIS];
+    float parking_target[N_AXIS];
+    float retract_waypoint = PARKING_PULLOUT_INCREMENT;
+    plan_line_data_t plan_data;
+    plan_line_data_t *pl_data = &plan_data;
+    memset(pl_data,0,sizeof(plan_line_data_t));
+    pl_data->condition = (PL_COND_FLAG_SYSTEM_MOTION|PL_COND_FLAG_NO_FEED_OVERRIDE);
+    pl_data->line_number = PARKING_MOTION_LINE_NUMBER;
+  #endif
+
+  plan_block_t *block = plan_get_current_block();
+  uint8_t restore_condition;
+  float restore_spindle_speed;
+  if (block == NULL) {
+    restore_condition = (gc_state.modal.spindle | gc_state.modal.coolant);
+    restore_spindle_speed = gc_state.spindle_speed;
+  } else {
+    restore_condition = (block->condition & PL_COND_SPINDLE_MASK) | coolant_get_state();
+    restore_spindle_speed = block->spindle_speed;
+  }
+  #ifdef DISABLE_LASER_DURING_HOLD
+    if (bit_istrue(settings.flags,BITFLAG_LASER_MODE)) {
+      system_set_exec_accessory_override_flag(EXEC_SPINDLE_OVR_STOP);
+    }
+  #endif
+
+  while (sys.suspend) {
+
+    if (sys.abort) { return; }
+
+    // Block until initial hold is complete and the machine has stopped motion.
+    if (sys.suspend & SUSPEND_HOLD_COMPLETE) {
+
+      // Parking manager. Handles de/re-energizing, switch state checks, and parking motions for
+      // the safety door and sleep states.
+      if (sys.state & (STATE_SAFETY_DOOR | STATE_SLEEP)) {
+
+        // Handles retraction motions and de-energizing.
+        if (bit_isfalse(sys.suspend,SUSPEND_RETRACT_COMPLETE)) {
+
+          // Ensure any prior spindle stop override is disabled at start of safety door routine.
+          sys.spindle_stop_ovr = SPINDLE_STOP_OVR_DISABLED;
+
+          #ifndef PARKING_ENABLE
+
+            spindle_set_state(SPINDLE_DISABLE,0.0); // De-energize
+            coolant_set_state(COOLANT_DISABLE);     // De-energize
+
+          #else
+
+            // Get current position and store restore location and spindle retract waypoint.
+            system_convert_array_steps_to_mpos(parking_target,sys_position);
+            if (bit_isfalse(sys.suspend,SUSPEND_RESTART_RETRACT)) {
+              memcpy(restore_target,parking_target,sizeof(parking_target));
+              retract_waypoint += restore_target[PARKING_AXIS];
+              retract_waypoint = min(retract_waypoint,PARKING_TARGET);
+            }
+
+            // Execute slow pull-out parking retract motion. Parking requires homing enabled, the
+            // current location not exceeding the parking target location, and laser mode disabled.
+            // NOTE: State is will remain DOOR, until the de-energizing and retract is complete.
+            #ifdef ENABLE_PARKING_OVERRIDE_CONTROL
+            if ((bit_istrue(settings.flags,BITFLAG_HOMING_ENABLE)) &&
+                            (parking_target[PARKING_AXIS] < PARKING_TARGET) &&
+                            bit_isfalse(settings.flags,BITFLAG_LASER_MODE) &&
+                            (sys.override_ctrl == OVERRIDE_PARKING_MOTION)) {
+            #else
+            if ((bit_istrue(settings.flags,BITFLAG_HOMING_ENABLE)) &&
+                            (parking_target[PARKING_AXIS] < PARKING_TARGET) &&
+                            bit_isfalse(settings.flags,BITFLAG_LASER_MODE)) {
+            #endif
+              // Retract spindle by pullout distance. Ensure retraction motion moves away from
+              // the workpiece and waypoint motion doesn't exceed the parking target location.
+              if (parking_target[PARKING_AXIS] < retract_waypoint) {
+                parking_target[PARKING_AXIS] = retract_waypoint;
+                pl_data->feed_rate = PARKING_PULLOUT_RATE;
+                pl_data->condition |= (restore_condition & PL_COND_ACCESSORY_MASK); // Retain accessory state
+                pl_data->spindle_speed = restore_spindle_speed;
+                mc_parking_motion(parking_target, pl_data);
+              }
+
+              // NOTE: Clear accessory state after retract and after an aborted restore motion.
+              pl_data->condition = (PL_COND_FLAG_SYSTEM_MOTION|PL_COND_FLAG_NO_FEED_OVERRIDE);
+              pl_data->spindle_speed = 0.0;
+              spindle_set_state(SPINDLE_DISABLE,0.0); // De-energize
+              coolant_set_state(COOLANT_DISABLE); // De-energize
+
+              // Execute fast parking retract motion to parking target location.
+              if (parking_target[PARKING_AXIS] < PARKING_TARGET) {
+                parking_target[PARKING_AXIS] = PARKING_TARGET;
+                pl_data->feed_rate = PARKING_RATE;
+                mc_parking_motion(parking_target, pl_data);
+              }
+
+            } else {
+
+              // Parking motion not possible. Just disable the spindle and coolant.
+              // NOTE: Laser mode does not start a parking motion to ensure the laser stops immediately.
+              spindle_set_state(SPINDLE_DISABLE,0.0); // De-energize
+              coolant_set_state(COOLANT_DISABLE);     // De-energize
+
+            }
+
+          #endif
+
+          sys.suspend &= ~(SUSPEND_RESTART_RETRACT);
+          sys.suspend |= SUSPEND_RETRACT_COMPLETE;
+
+        } else {
+
+
+          if (sys.state == STATE_SLEEP) {
+            report_feedback_message(MESSAGE_SLEEP_MODE);
+            // Spindle and coolant should already be stopped, but do it again just to be sure.
+            spindle_set_state(SPINDLE_DISABLE,0.0); // De-energize
+            coolant_set_state(COOLANT_DISABLE); // De-energize
+            st_go_idle(); // Disable steppers
+            while (!(sys.abort)) { protocol_exec_rt_system(); } // Do nothing until reset.
+            return; // Abort received. Return to re-initialize.
+          }
+
+          // Allows resuming from parking/safety door. Actively checks if safety door is closed and ready to resume.
+          if (sys.state == STATE_SAFETY_DOOR) {
+            if (!(system_check_safety_door_ajar())) {
+              sys.suspend &= ~(SUSPEND_SAFETY_DOOR_AJAR); // Reset door ajar flag to denote ready to resume.
+            }
+          }
+
+          // Handles parking restore and safety door resume.
+          if (sys.suspend & SUSPEND_INITIATE_RESTORE) {
+
+            #ifdef PARKING_ENABLE
+              // Execute fast restore motion to the pull-out position. Parking requires homing enabled.
+              // NOTE: State is will remain DOOR, until the de-energizing and retract is complete.
+              #ifdef ENABLE_PARKING_OVERRIDE_CONTROL
+              if (((settings.flags & (BITFLAG_HOMING_ENABLE|BITFLAG_LASER_MODE)) == BITFLAG_HOMING_ENABLE) &&
+                   (sys.override_ctrl == OVERRIDE_PARKING_MOTION)) {
+              #else
+              if ((settings.flags & (BITFLAG_HOMING_ENABLE|BITFLAG_LASER_MODE)) == BITFLAG_HOMING_ENABLE) {
+              #endif
+                // Check to ensure the motion doesn't move below pull-out position.
+                if (parking_target[PARKING_AXIS] <= PARKING_TARGET) {
+                  parking_target[PARKING_AXIS] = retract_waypoint;
+                  pl_data->feed_rate = PARKING_RATE;
+                  mc_parking_motion(parking_target, pl_data);
+                }
+              }
+            #endif
+
+            // Delayed Tasks: Restart spindle and coolant, delay to power-up, then resume cycle.
+            if (gc_state.modal.spindle != SPINDLE_DISABLE) {
+              // Block if safety door re-opened during prior restore actions.
+              if (bit_isfalse(sys.suspend,SUSPEND_RESTART_RETRACT)) {
+                if (bit_istrue(settings.flags,BITFLAG_LASER_MODE)) {
+                  // When in laser mode, ignore spindle spin-up delay. Set to turn on laser when cycle starts.
+                  bit_true(sys.step_control, STEP_CONTROL_UPDATE_SPINDLE_PWM);
+                } else {
+                  spindle_set_state((restore_condition & (PL_COND_FLAG_SPINDLE_CW | PL_COND_FLAG_SPINDLE_CCW)), restore_spindle_speed);
+                  delay_sec(SAFETY_DOOR_SPINDLE_DELAY, DELAY_MODE_SYS_SUSPEND);
+                }
+              }
+            }
+            if (gc_state.modal.coolant != COOLANT_DISABLE) {
+              // Block if safety door re-opened during prior restore actions.
+              if (bit_isfalse(sys.suspend,SUSPEND_RESTART_RETRACT)) {
+                // NOTE: Laser mode will honor this delay. An exhaust system is often controlled by this pin.
+                coolant_set_state((restore_condition & (PL_COND_FLAG_COOLANT_FLOOD | PL_COND_FLAG_COOLANT_MIST)));
+                delay_sec(SAFETY_DOOR_COOLANT_DELAY, DELAY_MODE_SYS_SUSPEND);
+              }
+            }
+
+            #ifdef PARKING_ENABLE
+              // Execute slow plunge motion from pull-out position to resume position.
+              #ifdef ENABLE_PARKING_OVERRIDE_CONTROL
+              if (((settings.flags & (BITFLAG_HOMING_ENABLE|BITFLAG_LASER_MODE)) == BITFLAG_HOMING_ENABLE) &&
+                   (sys.override_ctrl == OVERRIDE_PARKING_MOTION)) {
+              #else
+              if ((settings.flags & (BITFLAG_HOMING_ENABLE|BITFLAG_LASER_MODE)) == BITFLAG_HOMING_ENABLE) {
+              #endif
+                // Block if safety door re-opened during prior restore actions.
+                if (bit_isfalse(sys.suspend,SUSPEND_RESTART_RETRACT)) {
+                  // Regardless if the retract parking motion was a valid/safe motion or not, the
+                  // restore parking motion should logically be valid, either by returning to the
+                  // original position through valid machine space or by not moving at all.
+                  pl_data->feed_rate = PARKING_PULLOUT_RATE;
+                  pl_data->condition |= (restore_condition & PL_COND_ACCESSORY_MASK); // Restore accessory state
+                  pl_data->spindle_speed = restore_spindle_speed;
+                  mc_parking_motion(restore_target, pl_data);
+                }
+              }
+            #endif
+
+            if (bit_isfalse(sys.suspend,SUSPEND_RESTART_RETRACT)) {
+              sys.suspend |= SUSPEND_RESTORE_COMPLETE;
+              system_set_exec_state_flag(EXEC_CYCLE_START); // Set to resume program.
+            }
+          }
+
+        }
+
+
       } else {
-        pl.position[idx] = sys_position[idx];
+
+        // Feed hold manager. Controls spindle stop override states.
+        // NOTE: Hold ensured as completed by condition check at the beginning of suspend routine.
+        if (sys.spindle_stop_ovr) {
+          // Handles beginning of spindle stop
+          if (sys.spindle_stop_ovr & SPINDLE_STOP_OVR_INITIATE) {
+            if (gc_state.modal.spindle != SPINDLE_DISABLE) {
+              spindle_set_state(SPINDLE_DISABLE,0.0); // De-energize
+              sys.spindle_stop_ovr = SPINDLE_STOP_OVR_ENABLED; // Set stop override state to enabled, if de-energized.
+            } else {
+              sys.spindle_stop_ovr = SPINDLE_STOP_OVR_DISABLED; // Clear stop override state
+            }
+          // Handles restoring of spindle state
+          } else if (sys.spindle_stop_ovr & (SPINDLE_STOP_OVR_RESTORE | SPINDLE_STOP_OVR_RESTORE_CYCLE)) {
+            if (gc_state.modal.spindle != SPINDLE_DISABLE) {
+              report_feedback_message(MESSAGE_SPINDLE_RESTORE);
+              if (bit_istrue(settings.flags,BITFLAG_LASER_MODE)) {
+                // When in laser mode, ignore spindle spin-up delay. Set to turn on laser when cycle starts.
+                bit_true(sys.step_control, STEP_CONTROL_UPDATE_SPINDLE_PWM);
+              } else {
+                spindle_set_state((restore_condition & (PL_COND_FLAG_SPINDLE_CW | PL_COND_FLAG_SPINDLE_CCW)), restore_spindle_speed);
+              }
+            }
+            if (sys.spindle_stop_ovr & SPINDLE_STOP_OVR_RESTORE_CYCLE) {
+              system_set_exec_state_flag(EXEC_CYCLE_START);  // Set to resume program.
+            }
+            sys.spindle_stop_ovr = SPINDLE_STOP_OVR_DISABLED; // Clear stop override state
+          }
+        } else {
+          // Handles spindle state during hold. NOTE: Spindle speed overrides may be altered during hold state.
+          // NOTE: STEP_CONTROL_UPDATE_SPINDLE_PWM is automatically reset upon resume in step generator.
+          if (bit_istrue(sys.step_control, STEP_CONTROL_UPDATE_SPINDLE_PWM)) {
+            spindle_set_state((restore_condition & (PL_COND_FLAG_SPINDLE_CW | PL_COND_FLAG_SPINDLE_CCW)), restore_spindle_speed);
+            bit_false(sys.step_control, STEP_CONTROL_UPDATE_SPINDLE_PWM);
+          }
+        }
+
       }
-    #else
-      pl.position[idx] = sys_position[idx];
+    }
+
+    #ifdef SLEEP_ENABLE
+      // Check for sleep conditions and execute auto-park, if timeout duration elapses.
+      // Sleep is valid for both hold and door states, if the spindle or coolant are on or
+      // set to be re-enabled.
+      sleep_check();
     #endif
-  
+
+    protocol_exec_rt_system();
+
   }
-}
-
-
-// Returns the number of available blocks are in the planner buffer.
-uint8_t plan_get_block_buffer_available()
-{
-  if (block_buffer_head >= block_buffer_tail) { return((BLOCK_BUFFER_SIZE-1)-(block_buffer_head-block_buffer_tail)); }
-  return((block_buffer_tail-block_buffer_head-1));
-}
-
-
-// Returns the number of active blocks are in the planner buffer.
-// NOTE: Deprecated. Not used unless classic status reports are enabled in config.h
-uint8_t plan_get_block_buffer_count()
-{
-  if (block_buffer_head >= block_buffer_tail) { return(block_buffer_head-block_buffer_tail); }
-  return(BLOCK_BUFFER_SIZE - (block_buffer_tail-block_buffer_head));
-}
-
-
-// Re-initialize buffer plan with a partially completed block, assumed to exist at the buffer tail.
-// Called after a steppers have come to a complete stop for a feed hold and the cycle is stopped.
-void plan_cycle_reinitialize()
-{
-  // Re-plan from a complete stop. Reset planner entry speeds and buffer planned pointer.
-  st_update_plan_block_parameters();
-  block_buffer_planned = block_buffer_tail;
-  planner_recalculate();
 }
