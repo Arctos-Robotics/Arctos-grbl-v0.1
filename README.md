@@ -10,3 +10,5 @@ Use [this tutorial](https://arctosrobotics.com/2023/03/27/how-to-flash-the-arcto
 Wiring is illustrated bellow: 
 ![Pinout](https://github.com/ArctosRobotics/Arctos-grbl-v0.1/blob/edge/PINOUT.png)
 
+For Arctos robotic arm version 2.x.x use [this grbl version](https://github.com/ArctosRobotics/Arctos-grbl-v0.1/releases) which has no A axis compensation. 
+
